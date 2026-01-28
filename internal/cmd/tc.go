@@ -41,7 +41,7 @@ func protocolName(p uint8) string {
 	}
 }
 
-// intToIP converts uint32 to net.IP (assuming little-endian byte order as stored in map)
+// intToIP converts uint32 to net.IP (using little-endian byte order as stored by eBPF)
 func intToIP(i uint32) net.IP {
 	return net.IPv4(byte(i), byte(i>>8), byte(i>>16), byte(i>>24))
 }
@@ -79,7 +79,21 @@ func (fw *TCFirewall) Load() error {
 		return fmt.Errorf("remove memlock limit: %w", err)
 	}
 
-	if err := port_protection.LoadPortProtectionObjects(&fw.objs, nil); err != nil {
+	// Configure map pinning path for persistent maps
+	pinPath := "/sys/fs/bpf/tc-firewall"
+
+	// Create pin path directory if it doesn't exist
+	if err := os.MkdirAll(pinPath, 0755); err != nil {
+		return fmt.Errorf("create pin path directory %s: %w", pinPath, err)
+	}
+
+	opts := &ebpf.CollectionOptions{
+		Maps: ebpf.MapOptions{
+			PinPath: pinPath,
+		},
+	}
+
+	if err := port_protection.LoadPortProtectionObjects(&fw.objs, opts); err != nil {
 		return fmt.Errorf("load eBPF objects: %w", err)
 	}
 
@@ -176,8 +190,8 @@ func (fw *TCFirewall) PopulateMaps() error {
 			global.Logger.Sugar().Warnf("PopulateMaps: IP '%s' is not IPv4, skipping", ipStr)
 			continue
 		}
-		// Use LittleEndian so the in-memory byte representation matches network byte order
-		// This ensures eBPF can directly compare with ip->saddr
+		// Use LittleEndian so the in-memory byte representation matches what eBPF expects
+		// eBPF ip->saddr on x86 is stored in little-endian format
 		ipUint := binary.LittleEndian.Uint32(ipBytes)
 		global.Logger.Sugar().Debugf("PopulateMaps: adding IP %s -> uint32 %d (0x%08x)", ipStr, ipUint, ipUint)
 		if err := fw.objs.ProtectedIps.Update(ipUint, one, ebpf.UpdateAny); err != nil {
@@ -327,13 +341,14 @@ func (fw *TCFirewall) startEventReader() {
 					continue
 				}
 
+				// Parse event data (little-endian as stored by eBPF)
 				event := DropEvent{
-					SrcIP:    uint32(data[0]) | uint32(data[1])<<8 | uint32(data[2])<<16 | uint32(data[3])<<24,
-					Port:     uint16(data[4]) | uint16(data[5])<<8,
+					SrcIP:    binary.LittleEndian.Uint32(data[0:4]),
+					Port:     binary.LittleEndian.Uint16(data[4:6]),
 					Protocol: data[6],
 				}
 
-				global.Logger.Sugar().Infof("BLOCKED: client=%s attempted access to protected port %d/%s",
+				global.Logger.Sugar().Debugf("BLOCKED: client=%s attempted access to protected port %d/%s",
 					intToIP(event.SrcIP).String(),
 					event.Port,
 					protocolName(event.Protocol))
@@ -345,6 +360,16 @@ func (fw *TCFirewall) startEventReader() {
 // Close closes all resources
 func (fw *TCFirewall) Close() error {
 	global.Logger.Sugar().Info("Shutting down TC Firewall...")
+
+	// Remove pinned maps after closing (cleanup)
+	defer func() {
+		pinPath := "/sys/fs/bpf/tc-firewall"
+		if err := os.RemoveAll(pinPath); err != nil {
+			global.Logger.Sugar().Warnf("Failed to remove pin path %s: %v", pinPath, err)
+		} else {
+			global.Logger.Sugar().Debugf("Cleaned up pin path: %s", pinPath)
+		}
+	}()
 
 	// Signal all goroutines to stop
 	close(fw.stopCh)
@@ -382,6 +407,9 @@ func (fw *TCFirewall) Close() error {
 	}
 	if fw.objs.ProtectedPorts != nil {
 		fw.objs.ProtectedPorts.Close()
+	}
+	if fw.objs.LastEventTs != nil {
+		fw.objs.LastEventTs.Close()
 	}
 	fw.objs.Close()
 	return nil
