@@ -12,7 +12,8 @@
 - **动态配置热重载**: 支持配置文件热更新，无需重启服务
 - **多平台支持**: 支持 x86/x64、ARM32/64 架构
 - **静态编译**: 无需 libc 依赖，可部署在 Alpine 等最小化系统
-- **拦截日志**: 通过 perf event 输出被拦截的客户端 IP 信息
+- **拦截日志**: 通过 perf event 实时输出被拦截的客户端 IP 和端口信息（INFO 级别）
+- **优雅退出**: Ctrl+C 信号处理，2 秒内快速关闭，超时强制清理
 - **Linux 4.x 兼容**: 支持 Linux 4.x 及以上版本
 
 ## 快速开始
@@ -33,17 +34,20 @@ make help
 ### 运行
 
 ```bash
-# 不指定配置文件 - 允许所有流量
-sudo ./bin/tc-firewall -i <interface>
+# 基本运行（指定网卡和配置文件）
+sudo ./bin/tc-firewall -i eth0 -c /etc/tc-firewall/config.json
 
-# 指定配置文件 - 应用访问限制
-sudo ./bin/tc-firewall -i <interface> -c /etc/tc-firewall/config.json
+# 启用控制台输出查看拦截日志
+sudo ./bin/tc-firewall -i eth0 -c config.json --log.console
 
-# 启用动态配置热重载
-sudo ./bin/tc-firewall -i <interface> -c /etc/tc-firewall/config.json
+# 调试模式（查看详细日志）
+sudo ./bin/tc-firewall -i eth0 -c config.json --log.console --log.level=debug
 
-# 配置文件热重载是自动的，无需额外参数
+# 不指定配置文件 - 允许所有流量（仅用于测试）
+sudo ./bin/tc-firewall -i eth0
 ```
+
+**注意**: 配置文件修改后会自动热重载，无需重启服务。
 
 ### 命令行参数
 
@@ -64,7 +68,7 @@ sudo ./bin/tc-firewall -i <interface> -c /etc/tc-firewall/config.json
 **JSON 格式:**
 ```json
 {
-  "ips": ["192.168.1.100", "10.0.0.0/8"],
+  "ips": ["192.168.1.100", "10.0.0.5"],
   "ports": [3306, 6379, 80, 443]
 }
 ```
@@ -73,11 +77,15 @@ sudo ./bin/tc-firewall -i <interface> -c /etc/tc-firewall/config.json
 ```yaml
 ips:
   - 192.168.1.100
-  - 10.0.0.0/8
+  - 10.0.0.5
 ports:
   - 3306
   - 6379
 ```
+
+> **注意**:
+> - 目前仅支持精确 IP 地址匹配，暂不支持 CIDR 网段格式（如 `10.0.0.0/8`）。如需配置多个 IP，请逐个列出。
+> - 配置文件修改后会自动热重载，无需重启服务。
 
 **配置说明:**
 - `ips`: 允许访问受保护端口的白名单客户端 IP 列表
@@ -100,36 +108,19 @@ ports:
 当非白名单 IP 访问受保护端口被拦截时，日志会输出：
 
 ```
-2026-01-26 21:40:00  [tc-firewall] DEBUG  BLOCKED: src_ip=192.168.1.50 port=3306 protocol=TCP dir=ingress
+2026-01-28 12:40:00  [tc-firewall] INFO   BLOCKED: client=192.168.1.50 attempted access to protected port 3306/TCP
 ```
 
 日志字段说明:
-- `src_ip`: 被拦截的客户端源 IP
-- `port`: 目标端口
+- `client`: 被拦截的客户端源 IP
+- `protected port`: 受保护的目标端口
 - `protocol`: 协议 (TCP/UDP)
-- `dir`: 方向 (ingress/egress)
 
-## 动态配置热重载
+默认日志级别为 `info`，拦截日志直接可见。如需查看调试信息，可设置 `--log.level=debug`。
 
-tc-firewall 会自动监控配置文件的变化：
-
-```bash
-sudo ./bin/tc-firewall -i eth0 -c /etc/tc-firewall/config.json
-```
-
-当配置文件被修改时，防火墙会自动重新加载规则，无需重启服务。
-
-## 日志配置
-
-默认日志保存在 `/var/log/tc-firewall/tc-firewall.log`，可通过命令行参数配置：
-
-```bash
-# 启用控制台输出
-sudo ./bin/tc-firewall -i eth0 -c config.json --log.console
-
-# 设置日志级别为 debug
-sudo ./bin/tc-firewall -i eth0 -c config.json --log.level=debug
-```
+**日志输出位置**:
+- 默认: `/var/log/tc-firewall/tc-firewall.log`
+- 控制台输出: 添加 `--log.console` 参数
 
 ## 多平台构建
 
@@ -213,6 +204,15 @@ make build-amd64    # x86_64 服务器
 | `protected_ports` | HASH | uint16 (端口) | uint8 (1) | 受保护端口 |
 | `events` | PERF_EVENT_ARRAY | - | drop_event | 拦截事件输出 |
 
+### 性能特点
+
+| 特性 | 说明 |
+|------|------|
+| **包处理延迟** | < 1μs（内核态直接处理，无用户态拷贝） |
+| **并发连接** | 无状态过滤，不影响连接数 |
+| **内存占用** | 仅 eBPF Map 开销（约几 MB） |
+| **CPU 开销** | 仅命中过滤规则时进行 Map 查询 |
+
 ## 系统要求
 
 - **Linux Kernel**: 4.x, 5.x, 6.x (推荐 5.10+)
@@ -285,12 +285,36 @@ sudo bpftool map dump name protected_ips
 sudo bpftool map dump name protected_ports
 ```
 
+### 6. 没有拦截日志输出
+
+如果确认有流量被拦截（如 tcpdump 显示 SYN 无响应），但没有 BLOCKED 日志：
+
+```bash
+# 1. 确认日志级别为 info（默认）
+sudo ./bin/tc-firewall -i eth0 -c config.json --log.console
+
+# 2. 检查 perf event 是否正确读取
+sudo bpftool prog list | grep tc_ingress_filter
+sudo bpftool net list
+
+# 3. 验证 eBPF 程序正常挂载
+sudo tc filter show dev eth0 ingress
+```
+
+### 7. 程序关闭缓慢
+
+tc-firewall 已实现优雅退出机制：
+- 收到 Ctrl+C 或 SIGTERM 信号后，2 秒内完成资源清理
+- 如果超时，会强制关闭并输出警告日志
+- 无需手动清理 TC 过滤器，程序退出时会自动卸载
+
 ## 卸载
 
 ```bash
 # 停止 tc-firewall 程序 (Ctrl+C)
+# 程序会自动清理 TC 过滤器和 eBPF 资源
 
-# 手动清理 TC 过滤器
+# 如需手动清理 TC 过滤器（异常情况）
 sudo tc filter del dev eth0 ingress
 sudo tc filter del dev eth0 egress
 

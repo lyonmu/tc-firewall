@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -40,15 +41,7 @@ func protocolName(p uint8) string {
 	}
 }
 
-// directionName returns direction name
-func directionName(d uint8) string {
-	if d == 0 {
-		return "ingress"
-	}
-	return "egress"
-}
-
-// intToIP converts uint32 to net.IP
+// intToIP converts uint32 to net.IP (assuming little-endian byte order as stored in map)
 func intToIP(i uint32) net.IP {
 	return net.IPv4(byte(i), byte(i>>8), byte(i>>16), byte(i>>24))
 }
@@ -60,6 +53,7 @@ type TCFirewall struct {
 	configMgr *pkg.ConfigManager[config.FirewallConfig]
 	stopCh    chan struct{}
 	wg        sync.WaitGroup
+	eventRd   *perf.Reader // for graceful shutdown
 }
 
 // NewTCFirewall creates a new TC firewall instance with optional dynamic config hot-reload
@@ -89,6 +83,7 @@ func (fw *TCFirewall) Load() error {
 		return fmt.Errorf("load eBPF objects: %w", err)
 	}
 
+	global.Logger.Sugar().Debug("Load: eBPF programs loaded successfully")
 	return nil
 }
 
@@ -98,6 +93,8 @@ func (fw *TCFirewall) Attach(ifaceName string) error {
 	if err != nil {
 		return fmt.Errorf("get interface %s: %w", ifaceName, err)
 	}
+
+	global.Logger.Sugar().Infof("Attach: Found interface %s with index %d", ifaceName, iface.Index)
 
 	// Try TCX first (kernel 5.9+), fallback to RawLink for older kernels
 	fw.ingress, err = link.AttachTCX(link.TCXOptions{
@@ -109,16 +106,17 @@ func (fw *TCFirewall) Attach(ifaceName string) error {
 		// Fallback for Linux 4.x compatibility
 		global.Logger.Sugar().Warnf("TCX attach failed (%v), trying raw link fallback", err)
 		fw.ingress, err = link.AttachRawLink(link.RawLinkOptions{
-			Target:   iface.Index,
-			Program:  fw.objs.TcIngressFilter,
-			Attach:   ebpf.AttachNone,
-			Flags:    0,
+			Target:  iface.Index,
+			Program: fw.objs.TcIngressFilter,
+			Attach:  ebpf.AttachNone,
+			Flags:   0,
 		})
 	}
 	if err != nil {
 		return fmt.Errorf("attach TC ingress: %w", err)
 	}
 
+	global.Logger.Sugar().Infof("Attach: Successfully attached TC filter to %s (ingress)", ifaceName)
 	return nil
 }
 
@@ -140,6 +138,12 @@ func (fw *TCFirewall) PopulateMaps() error {
 	// Build maps for efficient lookup
 	allowedIPs := make(map[string]bool)
 	for _, ipStr := range cfg.AllowedIPs {
+		// Check if it's a CIDR format
+		if _, _, err := net.ParseCIDR(ipStr); err == nil {
+			global.Logger.Sugar().Warnf("PopulateMaps: CIDR format '%s' is not supported. Only exact IP addresses are supported. Use individual IPs like '10.0.0.1' instead of '10.0.0.0/8'. Skipping.", ipStr)
+			continue
+		}
+
 		ip := net.ParseIP(ipStr)
 		if ip == nil {
 			global.Logger.Sugar().Warnf("PopulateMaps: invalid IP format '%s', skipping", ipStr)
@@ -164,19 +168,29 @@ func (fw *TCFirewall) PopulateMaps() error {
 	for ipStr := range allowedIPs {
 		ip := net.ParseIP(ipStr)
 		if ip == nil {
+			global.Logger.Sugar().Warnf("PopulateMaps: invalid IP '%s', skipping", ipStr)
 			continue
 		}
 		ipBytes := ip.To4()
 		if ipBytes == nil {
+			global.Logger.Sugar().Warnf("PopulateMaps: IP '%s' is not IPv4, skipping", ipStr)
 			continue
 		}
-		ipUint := binary.BigEndian.Uint32(ipBytes)
+		// Use LittleEndian so the in-memory byte representation matches network byte order
+		// This ensures eBPF can directly compare with ip->saddr
+		ipUint := binary.LittleEndian.Uint32(ipBytes)
 		global.Logger.Sugar().Debugf("PopulateMaps: adding IP %s -> uint32 %d (0x%08x)", ipStr, ipUint, ipUint)
 		if err := fw.objs.ProtectedIps.Update(ipUint, one, ebpf.UpdateAny); err != nil {
 			global.Logger.Sugar().Errorf("PopulateMaps: failed to update IP map for %s: %v", ipStr, err)
 			return fmt.Errorf("update IP map for %s: %w", ipStr, err)
 		}
 		ipCount++
+	}
+
+	if ipCount > 0 {
+		global.Logger.Sugar().Debugf("PopulateMaps: Total IPs in map: %d", ipCount)
+	} else {
+		global.Logger.Sugar().Warn("PopulateMaps: No IPs were added to the map!")
 	}
 
 	// Populate port map: ports that are protected
@@ -190,7 +204,13 @@ func (fw *TCFirewall) PopulateMaps() error {
 		portCount++
 	}
 
-	global.Logger.Sugar().Infof("PopulateMaps: successfully populated %d IPs and %d ports to eBPF maps", ipCount, portCount)
+	if portCount > 0 {
+		global.Logger.Sugar().Debugf("PopulateMaps: Total ports in map: %d", portCount)
+	} else {
+		global.Logger.Sugar().Warn("PopulateMaps: No ports were added to the map!")
+	}
+
+	global.Logger.Sugar().Debugf("PopulateMaps: successfully populated %d IPs and %d ports to eBPF maps", ipCount, portCount)
 	return nil
 }
 
@@ -266,16 +286,21 @@ func (fw *TCFirewall) startEventReader() {
 		return
 	}
 
-	rd, err := perf.NewReader(fw.objs.Events, 4096)
+	// Use larger buffer for high-traffic scenarios (per CPU)
+	rd, err := perf.NewReader(fw.objs.Events, 8192)
 	if err != nil {
 		global.Logger.Sugar().Errorf("Failed to create perf reader: %v", err)
 		return
 	}
+	fw.eventRd = rd
+	global.Logger.Sugar().Debug("Event reader started successfully")
 
 	fw.wg.Add(1)
 	go func() {
 		defer fw.wg.Done()
-		defer rd.Close()
+		defer func() {
+			fw.eventRd = nil
+		}()
 
 		for {
 			select {
@@ -287,18 +312,18 @@ func (fw *TCFirewall) startEventReader() {
 					if err == perf.ErrClosed {
 						return
 					}
+					// Ignore errors during shutdown (reader closed)
+					if strings.Contains(err.Error(), "closed") || strings.Contains(err.Error(), "epoll") {
+						return
+					}
 					global.Logger.Sugar().Errorf("Failed to read from perf buffer: %v", err)
 					time.Sleep(100 * time.Millisecond)
 					continue
 				}
 
-				// Skip perf event header (8 bytes), read DropEvent from data
-				if len(record.RawSample) < 8 {
-					continue
-				}
-
-				data := record.RawSample[8:] // Skip perf header
-				if len(data) < 10 { // DropEvent is 10 bytes
+				// RawSample contains the event data directly (no perf header to skip)
+				data := record.RawSample
+				if len(data) < 8 { // DropEvent is 8 bytes (4+2+1+1)
 					continue
 				}
 
@@ -306,14 +331,12 @@ func (fw *TCFirewall) startEventReader() {
 					SrcIP:    uint32(data[0]) | uint32(data[1])<<8 | uint32(data[2])<<16 | uint32(data[3])<<24,
 					Port:     uint16(data[4]) | uint16(data[5])<<8,
 					Protocol: data[6],
-					Dir:      data[7],
 				}
 
-				global.Logger.Sugar().Debugf("BLOCKED: src_ip=%s port=%d protocol=%s dir=%s",
+				global.Logger.Sugar().Infof("BLOCKED: client=%s attempted access to protected port %d/%s",
 					intToIP(event.SrcIP).String(),
 					event.Port,
-					protocolName(event.Protocol),
-					directionName(event.Dir))
+					protocolName(event.Protocol))
 			}
 		}
 	}()
@@ -321,9 +344,29 @@ func (fw *TCFirewall) startEventReader() {
 
 // Close closes all resources
 func (fw *TCFirewall) Close() error {
-	// Stop config watcher
+	global.Logger.Sugar().Info("Shutting down TC Firewall...")
+
+	// Signal all goroutines to stop
 	close(fw.stopCh)
-	fw.wg.Wait()
+
+	// Close event reader first to unblock Read()
+	if fw.eventRd != nil {
+		fw.eventRd.Close()
+	}
+
+	// Wait for goroutines to exit with timeout
+	done := make(chan struct{})
+	go func() {
+		fw.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Goroutines exited cleanly
+	case <-time.After(2 * time.Second):
+		global.Logger.Sugar().Warn("Timeout waiting for goroutines to exit, forcing shutdown")
+	}
 
 	// Close config manager
 	if fw.configMgr != nil {
@@ -342,6 +385,40 @@ func (fw *TCFirewall) Close() error {
 	}
 	fw.objs.Close()
 	return nil
+}
+
+// DumpMaps dumps the contents of eBPF maps for debugging
+func (fw *TCFirewall) DumpMaps() {
+	global.Logger.Sugar().Debug("=== Dumping eBPF Map Contents ===")
+
+	// Dump IP map
+	if fw.objs.ProtectedIps != nil {
+		var ipKey uint32
+		var ipValue uint8
+		iter := fw.objs.ProtectedIps.Iterate()
+		count := 0
+		for iter.Next(&ipKey, &ipValue) {
+			ip := intToIP(ipKey)
+			global.Logger.Sugar().Debugf("  IP map entry: %s -> %d", ip.String(), ipValue)
+			count++
+		}
+		global.Logger.Sugar().Debugf("  Total IP entries: %d", count)
+	}
+
+	// Dump port map
+	if fw.objs.ProtectedPorts != nil {
+		var portKey uint16
+		var portValue uint8
+		iter := fw.objs.ProtectedPorts.Iterate()
+		count := 0
+		for iter.Next(&portKey, &portValue) {
+			global.Logger.Sugar().Debugf("  Port map entry: %d -> %d", portKey, portValue)
+			count++
+		}
+		global.Logger.Sugar().Debugf("  Total port entries: %d", count)
+	}
+
+	global.Logger.Sugar().Debug("=== End Map Dump ===")
 }
 
 // StartTCFirewall starts the TC firewall with the given interface and config path
@@ -379,12 +456,21 @@ func StartTCFirewall(ifaceName string, configPath string, configType string) {
 	fw.startConfigWatcher()
 	if fw.configMgr != nil {
 		cfg := fw.configMgr.GetConfig()
-		if len(cfg.AllowedIPs) > 0 && len(cfg.AllowedPorts) > 0 {
-			global.Logger.Sugar().Infof("TC Firewall active on %s - blocking non-allowed IPs from %d protected ports (ingress only)", ifaceName, len(cfg.AllowedPorts))
-		} else {
+		if len(cfg.AllowedIPs) == 0 && len(cfg.AllowedPorts) == 0 {
 			global.Logger.Sugar().Errorf("TC Firewall active on %s - no restrictions configured (allow all mode)", ifaceName)
 			os.Exit(0)
 		}
+
+		if len(cfg.AllowedPorts) > 0 {
+			global.Logger.Sugar().Infof("TC Firewall active on %s - blocking non-allowed IPs from %d protected ports (ingress only)", ifaceName, len(cfg.AllowedPorts))
+		} else {
+			global.Logger.Sugar().Infof("TC Firewall active on %s - IP whitelist configured, all ports protected for whitelisted IPs only", ifaceName)
+		}
+		if len(cfg.AllowedIPs) > 0 {
+			global.Logger.Sugar().Debugf("  - Whitelisted IPs: %d", len(cfg.AllowedIPs))
+		}
+		// Dump maps for verification
+		fw.DumpMaps()
 	} else {
 		global.Logger.Sugar().Errorf("TC Firewall active on %s - no restrictions configured (allow all mode)", ifaceName)
 		os.Exit(0)
@@ -394,6 +480,4 @@ func StartTCFirewall(ifaceName string, configPath string, configType string) {
 	stop := make(chan os.Signal, 5)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
-
-	global.Logger.Sugar().Info("Shutting down TC Firewall...")
 }
