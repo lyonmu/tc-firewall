@@ -73,6 +73,8 @@ struct {
 // Rate limit: minimum interval between events (10ms = 100 events/sec)
 #define EVENT_INTERVAL_NS 10000000ULL
 
+#define LOCALHOST_IP 0x0100007F  //
+
 // Helper: check if we can send a perf event (rate limiting)
 // Returns 1 if event can be sent, 0 if rate limited
 static inline __u8 can_send_event(void) {
@@ -128,7 +130,7 @@ int tc_ingress_filter(struct __sk_buff *skb) {
     __u32 src_ip = ip->saddr;
 
     // Allow localhost without checking
-    if (src_ip == 0x0100007F) {  // 127.0.0.1 in network byte order
+    if (src_ip == LOCALHOST_IP) {  // 127.0.0.1 in network byte order
         return TC_ACT_OK;
     }
 
