@@ -59,13 +59,16 @@ func (cm *ConfigManager[T]) LoadConfig(path string, filetype string) error {
 
 // watchConfig 监听配置文件变化
 func (cm *ConfigManager[T]) watchConfig() {
+	// Helper to get logger safely
+	log := global.GetLogger()
+
 	// 设置配置变更回调
 	cm.v.OnConfigChange(func(e fsnotify.Event) {
 		cm.mu.Lock()
 		defer cm.mu.Unlock()
 
-		if global.Logger != nil {
-			global.Logger.Sugar().Infof("Config file updated: %s", e.Name)
+		if log != nil {
+			log.Sugar().Infof("Config file updated: %s", e.Name)
 		} else {
 			fmt.Printf("Config file updated: %s\n", e.Name)
 		}
@@ -73,8 +76,8 @@ func (cm *ConfigManager[T]) watchConfig() {
 		var newCfg T
 		// 重新读取配置
 		if err := cm.v.ReadInConfig(); err != nil {
-			if global.Logger != nil {
-				global.Logger.Sugar().Errorf("Failed to read updated config: %v", err)
+			if log != nil {
+				log.Sugar().Errorf("Failed to read updated config: %v", err)
 			} else {
 				fmt.Fprintf(os.Stderr, "Failed to read updated config: %v\n", err)
 			}
@@ -83,8 +86,8 @@ func (cm *ConfigManager[T]) watchConfig() {
 
 		// 解析到新配置
 		if err := cm.v.Unmarshal(&newCfg); err != nil {
-			if global.Logger != nil {
-				global.Logger.Sugar().Errorf("Failed to unmarshal updated config: %v", err)
+			if log != nil {
+				log.Sugar().Errorf("Failed to unmarshal updated config: %v", err)
 			} else {
 				fmt.Fprintf(os.Stderr, "Failed to unmarshal updated config: %v\n", err)
 			}
@@ -93,8 +96,8 @@ func (cm *ConfigManager[T]) watchConfig() {
 
 		// 更新配置
 		cm.cfg = newCfg
-		if global.Logger != nil {
-			global.Logger.Sugar().Info("Config successfully reloaded")
+		if log != nil {
+			log.Sugar().Info("Config successfully reloaded")
 		} else {
 			fmt.Println("Config successfully reloaded")
 		}
