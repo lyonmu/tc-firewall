@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"sync"
@@ -48,12 +49,13 @@ func intToIP(i uint32) net.IP {
 
 // TCFirewall handles the TC-based port protection eBPF program with dynamic config hot-reload
 type TCFirewall struct {
-	objs      port_protection.PortProtectionObjects
-	ingress   link.Link
-	configMgr *pkg.ConfigManager[config.FirewallConfig]
-	stopCh    chan struct{}
-	wg        sync.WaitGroup
-	eventRd   *perf.Reader // for graceful shutdown
+	objs          port_protection.PortProtectionObjects
+	ingress       link.Link
+	tcLinkCleanup func() // cleanup function for tc command created links
+	configMgr     *pkg.ConfigManager[config.FirewallConfig]
+	stopCh        chan struct{}
+	wg            sync.WaitGroup
+	eventRd       *perf.Reader // for graceful shutdown
 }
 
 // NewTCFirewall creates a new TC firewall instance with optional dynamic config hot-reload
@@ -117,20 +119,85 @@ func (fw *TCFirewall) Attach(ifaceName string) error {
 		Attach:    ebpf.AttachTCXIngress,
 	})
 	if err != nil {
-		// Fallback for Linux 4.x compatibility
-		global.Logger.Sugar().Warnf("TCX attach failed (%v), trying raw link fallback", err)
+		// Try RawLink with AttachNone (kernel 4.x compatible)
 		fw.ingress, err = link.AttachRawLink(link.RawLinkOptions{
 			Target:  iface.Index,
 			Program: fw.objs.TcIngressFilter,
-			Attach:  ebpf.AttachNone,
+			Attach:  ebpf.AttachNone, // For kernel 4.x, use AttachNone instead of AttachTCXIngress
 			Flags:   0,
 		})
+	}
+	if err != nil {
+		// Final fallback: use tc command (kernel 4.x compatible)
+		global.Logger.Sugar().Warnf("RawLink attach failed (%v), trying tc command fallback", err)
+		err = fw.attachViaTCCommand(ifaceName)
 	}
 	if err != nil {
 		return fmt.Errorf("attach TC ingress: %w", err)
 	}
 
 	global.Logger.Sugar().Infof("Attach: Successfully attached TC filter to %s (ingress)", ifaceName)
+	return nil
+}
+
+// attachViaTCCommand uses bpftool to attach eBPF program (kernel 4.x compatible)
+func (fw *TCFirewall) attachViaTCCommand(ifaceName string) error {
+	// For kernel 4.x, we use bpftool to pin the program and attach via tc command
+	// because cilium/ebpf's RawLink may not work on all 4.x versions
+
+	progPath := "/sys/fs/bpf/tc-firewall/tc_ingress_filter"
+
+	// Get program info to get the program name
+	progInfo, err := fw.objs.TcIngressFilter.Info()
+	if err != nil {
+		return fmt.Errorf("get program info: %w", err)
+	}
+	progName := progInfo.Name
+
+	global.Logger.Sugar().Debugf("attachViaTCCommand: pinning program '%s' to %s", progName, progPath)
+
+	// Use bpftool to pin the eBPF program
+	// Different bpftool versions have different argument orders, try both
+	var pinCmd *exec.Cmd
+	var output []byte
+
+	// Try standard syntax: bpftool prog pin name <name> <path>
+	pinCmd = exec.Command("bpftool", "prog", "pin", "name", progName, progPath)
+	output, err = pinCmd.CombinedOutput()
+	if err != nil {
+		global.Logger.Sugar().Warnf("pin program with name-first syntax failed (%v), trying path-first syntax", err)
+		// Try alternative syntax: bpftool prog pin <path> name <name>
+		pinCmd = exec.Command("bpftool", "prog", "pin", progPath, "name", progName)
+		output, err = pinCmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("pin program (name=%s, path=%s): %w, output: %s", progName, progPath, err, string(output))
+		}
+	}
+
+	// Create clsact qdisc (ignore "file exists" error)
+	qdiscCmd := exec.Command("tc", "qdisc", "add", "dev", ifaceName, "clsact")
+	if err := qdiscCmd.Run(); err != nil {
+		if !strings.Contains(err.Error(), "file exists") &&
+			!strings.Contains(err.Error(), "already exists") {
+			return fmt.Errorf("add clsact qdisc: %w", err)
+		}
+	}
+
+	// Add eBPF filter using pinned object
+	filterCmd := exec.Command("tc", "filter", "add", "dev", ifaceName, "ingress",
+		"bpf", "direct-action", "object-pinned", progPath)
+	if err := filterCmd.Run(); err != nil {
+		return fmt.Errorf("add TC filter: %w", err)
+	}
+
+	// Store cleanup function for Close()
+	fw.tcLinkCleanup = func() {
+		exec.Command("tc", "filter", "del", "dev", ifaceName, "ingress").Run()
+		os.Remove(progPath)
+	}
+	fw.ingress = nil // No link to close via cilium/ebpf
+
+	global.Logger.Sugar().Infof("attachViaTCCommand: successfully attached TC filter via tc command to %s", ifaceName)
 	return nil
 }
 
@@ -399,6 +466,11 @@ func (fw *TCFirewall) Close() error {
 	}
 
 	// Close eBPF resources
+	// Cleanup tc command created link first (if any)
+	if fw.tcLinkCleanup != nil {
+		fw.tcLinkCleanup()
+		fw.tcLinkCleanup = nil
+	}
 	if fw.ingress != nil {
 		fw.ingress.Close()
 	}
@@ -485,14 +557,14 @@ func StartTCFirewall(ifaceName string, configPath string, configType string) {
 	if fw.configMgr != nil {
 		cfg := fw.configMgr.GetConfig()
 		if len(cfg.AllowedIPs) == 0 && len(cfg.AllowedPorts) == 0 {
-			global.Logger.Sugar().Errorf("TC Firewall active on %s - no restrictions configured (allow all mode)", ifaceName)
+			global.Logger.Sugar().Infof("TC Firewall active on %s - no restrictions configured (allow all mode)", ifaceName)
 			os.Exit(0)
 		}
 
 		if len(cfg.AllowedPorts) > 0 {
 			global.Logger.Sugar().Infof("TC Firewall active on %s - blocking non-allowed IPs from %d protected ports (ingress only)", ifaceName, len(cfg.AllowedPorts))
 		} else {
-			global.Logger.Sugar().Infof("TC Firewall active on %s - IP whitelist configured, all ports protected for whitelisted IPs only", ifaceName)
+			global.Logger.Sugar().Infof("TC Firewall active on %s - IP whitelist configured, no ports protected (allow all mode)", ifaceName)
 		}
 		if len(cfg.AllowedIPs) > 0 {
 			global.Logger.Sugar().Debugf("  - Whitelisted IPs: %d", len(cfg.AllowedIPs))

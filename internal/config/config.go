@@ -9,7 +9,7 @@ type Config struct {
 	Version    bool             `short:"v" long:"version" help:"显示版本信息" default:"false"`
 	Log        logger.LogConfig `embed:"" prefix:"log."`
 	Interface  string           `short:"i" long:"interface" default:"eth0" help:"Network interface to attach to" required:"true"`
-	ConfigPath string           `short:"c" long:"config-path" default:"config.json" help:"Path to configuration file (optional, default allows all traffic)" required:"true"`
+	ConfigPath string           `short:"c" long:"config-path" default:"config.json" help:"Path to configuration file (optional, if file doesn't exist or is empty, allows all traffic)"`
 	ConfigType string           `enum:"json,yaml,toml" default:"json" short:"t" long:"config-type" help:"Type of configuration (json, yaml, etc.) (optional, default is json)"`
 }
 
