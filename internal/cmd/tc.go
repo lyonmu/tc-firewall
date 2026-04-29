@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -47,21 +48,37 @@ func intToIP(i uint32) net.IP {
 	return net.IPv4(byte(i), byte(i>>8), byte(i>>16), byte(i>>24))
 }
 
+// validateInterfaceName validates that interface name is safe for shell commands
+func validateInterfaceName(name string) error {
+	if len(name) == 0 || len(name) > 15 {
+		return fmt.Errorf("invalid interface name length: %s", name)
+	}
+	for _, c := range name {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
+			return fmt.Errorf("invalid interface name: %s", name)
+		}
+	}
+	return nil
+}
+
 // TCFirewall handles the TC-based port protection eBPF program with dynamic config hot-reload
 type TCFirewall struct {
 	objs          port_protection.PortProtectionObjects
 	ingress       link.Link
 	tcLinkCleanup func() // cleanup function for tc command created links
 	configMgr     *pkg.ConfigManager[config.FirewallConfig]
-	stopCh        chan struct{}
+	ctx           context.Context
+	cancel        context.CancelFunc
 	wg            sync.WaitGroup
 	eventRd       *perf.Reader // for graceful shutdown
 }
 
 // NewTCFirewall creates a new TC firewall instance with optional dynamic config hot-reload
 func NewTCFirewall(configPath string, configType string) (*TCFirewall, error) {
+	ctx, cancel := context.WithCancel(context.Background())
 	fw := &TCFirewall{
-		stopCh: make(chan struct{}),
+		ctx:    ctx,
+		cancel: cancel,
 	}
 
 	if configPath != "" {
@@ -143,6 +160,11 @@ func (fw *TCFirewall) Attach(ifaceName string) error {
 
 // attachViaTCCommand uses bpftool to attach eBPF program (kernel 4.x compatible)
 func (fw *TCFirewall) attachViaTCCommand(ifaceName string) error {
+	// Validate interface name before passing to shell commands
+	if err := validateInterfaceName(ifaceName); err != nil {
+		return fmt.Errorf("validate interface name: %w", err)
+	}
+
 	// For kernel 4.x, we use bpftool to pin the program and attach via tc command
 	// because cilium/ebpf's RawLink may not work on all 4.x versions
 
@@ -159,18 +181,22 @@ func (fw *TCFirewall) attachViaTCCommand(ifaceName string) error {
 
 	global.GetLogger().Sugar().Debugf("attachViaTCCommand: pinning program '%s' to %s", progName, progPath)
 
+	// Use context with timeout for external commands
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	// Use bpftool to pin the eBPF program
 	// Different bpftool versions have different argument orders, try both
 	var pinCmd *exec.Cmd
 	var output []byte
 
 	// Try standard syntax: bpftool prog pin name <name> <path>
-	pinCmd = exec.Command("bpftool", "prog", "pin", "name", progName, progPath)
+	pinCmd = exec.CommandContext(ctx, "bpftool", "prog", "pin", "name", progName, progPath)
 	output, err = pinCmd.CombinedOutput()
 	if err != nil {
 		global.GetLogger().Sugar().Warnf("pin program with name-first syntax failed (%v), trying path-first syntax", err)
 		// Try alternative syntax: bpftool prog pin <path> name <name>
-		pinCmd = exec.Command("bpftool", "prog", "pin", progPath, "name", progName)
+		pinCmd = exec.CommandContext(ctx, "bpftool", "prog", "pin", progPath, "name", progName)
 		output, err = pinCmd.CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("pin program (name=%s, path=%s): %w, output: %s", progName, progPath, err, string(output))
@@ -178,7 +204,7 @@ func (fw *TCFirewall) attachViaTCCommand(ifaceName string) error {
 	}
 
 	// Create clsact qdisc (ignore "file exists" error)
-	qdiscCmd := exec.Command("tc", "qdisc", "add", "dev", ifaceName, "clsact")
+	qdiscCmd := exec.CommandContext(ctx, "tc", "qdisc", "add", "dev", ifaceName, "clsact")
 	if err := qdiscCmd.Run(); err != nil {
 		if !strings.Contains(err.Error(), "file exists") &&
 			!strings.Contains(err.Error(), "already exists") {
@@ -187,7 +213,7 @@ func (fw *TCFirewall) attachViaTCCommand(ifaceName string) error {
 	}
 
 	// Add eBPF filter using pinned object
-	filterCmd := exec.Command("tc", "filter", "add", "dev", ifaceName, "ingress",
+	filterCmd := exec.CommandContext(ctx, "tc", "filter", "add", "dev", ifaceName, "ingress",
 		"bpf", "direct-action", "object-pinned", progPath)
 	if err := filterCmd.Run(); err != nil {
 		return fmt.Errorf("add TC filter: %w", err)
@@ -326,20 +352,19 @@ func (fw *TCFirewall) ClearMaps() error {
 }
 
 // ReloadConfig reloads the configuration from the config manager
-// This function performs atomic reload to avoid security gaps during reconfiguration
+// This function performs atomic reload using update-in-place to avoid security gaps during reconfiguration
 func (fw *TCFirewall) ReloadConfig() error {
-	// Backup current config
+	// Get current and new configs
 	var oldCfg config.FirewallConfig
 	if fw.configMgr != nil {
 		oldCfg = fw.configMgr.GetConfig()
 	}
-
-	// Try to build new maps
-	newIPs := make(map[uint32]uint8)
-	newPorts := make(map[uint16]uint8)
-
 	cfg := fw.configMgr.GetConfig()
 	one := uint8(1)
+
+	// Build new maps
+	newIPs := make(map[uint32]uint8)
+	newPorts := make(map[uint16]uint8)
 
 	// Build IP map
 	for _, ipStr := range cfg.AllowedIPs {
@@ -366,29 +391,67 @@ func (fw *TCFirewall) ReloadConfig() error {
 		newPorts[port] = one
 	}
 
-	// Clear old maps and populate new ones atomically
-	// If we fail during population, we try to restore old entries
-	if err := fw.ClearMaps(); err != nil {
-		// Restore old config if clear fails
-		fw.restoreMaps(oldCfg)
-		return fmt.Errorf("clear maps: %w", err)
-	}
+	// Build current maps for comparison
+	currentIPs := make(map[uint32]uint8)
+	currentPorts := make(map[uint16]uint8)
 
-	// Populate new IPs
-	for ipUint := range newIPs {
-		if err := fw.objs.ProtectedIps.Update(ipUint, one, ebpf.UpdateAny); err != nil {
-			// Restore old config if update fails
-			fw.restoreMaps(oldCfg)
-			return fmt.Errorf("update IP map: %w", err)
+	if fw.objs.ProtectedIps != nil {
+		var ipKey uint32
+		var ipValue uint8
+		iter := fw.objs.ProtectedIps.Iterate()
+		for iter.Next(&ipKey, &ipValue) {
+			currentIPs[ipKey] = ipValue
 		}
 	}
 
-	// Populate new ports
-	for port := range newPorts {
-		if err := fw.objs.ProtectedPorts.Update(port, one, ebpf.UpdateAny); err != nil {
-			// Restore old config if update fails
-			fw.restoreMaps(oldCfg)
-			return fmt.Errorf("update port map: %w", err)
+	if fw.objs.ProtectedPorts != nil {
+		var portKey uint16
+		var portValue uint8
+		iter := fw.objs.ProtectedPorts.Iterate()
+		for iter.Next(&portKey, &portValue) {
+			currentPorts[portKey] = portValue
+		}
+	}
+
+	// Remove entries that are no longer in new config
+	for ipKey := range currentIPs {
+		if _, exists := newIPs[ipKey]; !exists {
+			if err := fw.objs.ProtectedIps.Delete(ipKey); err != nil {
+				return fmt.Errorf("delete IP from map: %w", err)
+			}
+		}
+	}
+
+	for portKey := range currentPorts {
+		if _, exists := newPorts[portKey]; !exists {
+			if err := fw.objs.ProtectedPorts.Delete(portKey); err != nil {
+				return fmt.Errorf("delete port from map: %w", err)
+			}
+		}
+	}
+
+	// Add new entries that are not in current config
+	for ipKey := range newIPs {
+		if _, exists := currentIPs[ipKey]; !exists {
+			if err := fw.objs.ProtectedIps.Update(ipKey, one, ebpf.UpdateAny); err != nil {
+				// Try to restore old config on failure
+				if restoreErr := fw.restoreMaps(oldCfg); restoreErr != nil {
+					global.GetLogger().Sugar().Errorf("Failed to restore maps after error: %v", restoreErr)
+				}
+				return fmt.Errorf("update IP map: %w", err)
+			}
+		}
+	}
+
+	for portKey := range newPorts {
+		if _, exists := currentPorts[portKey]; !exists {
+			if err := fw.objs.ProtectedPorts.Update(portKey, one, ebpf.UpdateAny); err != nil {
+				// Try to restore old config on failure
+				if restoreErr := fw.restoreMaps(oldCfg); restoreErr != nil {
+					global.GetLogger().Sugar().Errorf("Failed to restore maps after error: %v", restoreErr)
+				}
+				return fmt.Errorf("update port map: %w", err)
+			}
 		}
 	}
 
@@ -397,11 +460,13 @@ func (fw *TCFirewall) ReloadConfig() error {
 }
 
 // restoreMaps restores the maps to the given config
-func (fw *TCFirewall) restoreMaps(cfg config.FirewallConfig) {
+func (fw *TCFirewall) restoreMaps(cfg config.FirewallConfig) error {
 	one := uint8(1)
 
 	// Clear current maps
-	fw.ClearMaps()
+	if err := fw.ClearMaps(); err != nil {
+		return fmt.Errorf("clear maps during restore: %w", err)
+	}
 
 	// Restore IPs
 	for _, ipStr := range cfg.AllowedIPs {
@@ -414,13 +479,19 @@ func (fw *TCFirewall) restoreMaps(cfg config.FirewallConfig) {
 			continue
 		}
 		ipUint := binary.LittleEndian.Uint32(ipBytes)
-		fw.objs.ProtectedIps.Update(ipUint, one, ebpf.UpdateAny)
+		if err := fw.objs.ProtectedIps.Update(ipUint, one, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("restore IP %s: %w", ipStr, err)
+		}
 	}
 
 	// Restore ports
 	for _, port := range cfg.AllowedPorts {
-		fw.objs.ProtectedPorts.Update(port, one, ebpf.UpdateAny)
+		if err := fw.objs.ProtectedPorts.Update(port, one, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("restore port %d: %w", port, err)
+		}
 	}
+
+	return nil
 }
 
 // startConfigWatcher starts the background goroutine to watch for config changes
@@ -441,7 +512,7 @@ func (fw *TCFirewall) startConfigWatcher() {
 				} else {
 					global.GetLogger().Sugar().Info("Config successfully reloaded and eBPF maps updated")
 				}
-			case <-fw.stopCh:
+			case <-fw.ctx.Done():
 				return
 			}
 		}
@@ -472,7 +543,7 @@ func (fw *TCFirewall) startEventReader() {
 
 		for {
 			select {
-			case <-fw.stopCh:
+			case <-fw.ctx.Done():
 				return
 			default:
 				record, err := rd.Read()
@@ -527,7 +598,7 @@ func (fw *TCFirewall) Close() error {
 	}()
 
 	// Signal all goroutines to stop
-	close(fw.stopCh)
+	fw.cancel()
 
 	// Close event reader first to unblock Read()
 	if fw.eventRd != nil {

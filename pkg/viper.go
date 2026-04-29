@@ -2,12 +2,12 @@ package pkg
 
 import (
 	"fmt"
-	"os"
 	"sync"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/lyonmu/tc-firewall/internal/global"
 	"github.com/spf13/viper"
+	"go.uber.org/zap"
 )
 
 // ConfigManager 是一个泛型配置管理器，支持类型安全的配置热重载
@@ -61,46 +61,33 @@ func (cm *ConfigManager[T]) LoadConfig(path string, filetype string) error {
 func (cm *ConfigManager[T]) watchConfig() {
 	// Helper to get logger safely
 	log := global.GetLogger()
+	if log == nil {
+		log = zap.NewNop() // Use no-op logger as fallback
+	}
 
 	// 设置配置变更回调
 	cm.v.OnConfigChange(func(e fsnotify.Event) {
 		cm.mu.Lock()
 		defer cm.mu.Unlock()
 
-		if log != nil {
-			log.Sugar().Infof("Config file updated: %s", e.Name)
-		} else {
-			fmt.Printf("Config file updated: %s\n", e.Name)
-		}
+		log.Sugar().Infof("Config file updated: %s", e.Name)
 
 		var newCfg T
 		// 重新读取配置
 		if err := cm.v.ReadInConfig(); err != nil {
-			if log != nil {
-				log.Sugar().Errorf("Failed to read updated config: %v", err)
-			} else {
-				fmt.Fprintf(os.Stderr, "Failed to read updated config: %v\n", err)
-			}
+			log.Sugar().Errorf("Failed to read updated config: %v", err)
 			return
 		}
 
 		// 解析到新配置
 		if err := cm.v.Unmarshal(&newCfg); err != nil {
-			if log != nil {
-				log.Sugar().Errorf("Failed to unmarshal updated config: %v", err)
-			} else {
-				fmt.Fprintf(os.Stderr, "Failed to unmarshal updated config: %v\n", err)
-			}
+			log.Sugar().Errorf("Failed to unmarshal updated config: %v", err)
 			return
 		}
 
 		// 更新配置
 		cm.cfg = newCfg
-		if log != nil {
-			log.Sugar().Info("Config successfully reloaded")
-		} else {
-			fmt.Println("Config successfully reloaded")
-		}
+		log.Sugar().Info("Config successfully reloaded")
 
 		// 通知监听者配置已变更
 		select {
@@ -144,9 +131,5 @@ func (cm *ConfigManager[T]) Watch() <-chan struct{} {
 // Close 停止监听配置变化
 func (cm *ConfigManager[T]) Close() {
 	close(cm.exit)
-	// 清空watchCh，防止内存泄漏
-	go func() {
-		for range cm.watchCh {
-		}
-	}()
+	close(cm.watchCh)
 }
