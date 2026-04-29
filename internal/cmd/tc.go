@@ -43,9 +43,11 @@ func protocolName(p uint8) string {
 	}
 }
 
-// intToIP converts uint32 to net.IP (using little-endian byte order as stored by eBPF)
+// intToIP converts uint32 to net.IP (network byte order / big-endian as stored by eBPF)
 func intToIP(i uint32) net.IP {
-	return net.IPv4(byte(i), byte(i>>8), byte(i>>16), byte(i>>24))
+	ip := make(net.IP, 4)
+	binary.BigEndian.PutUint32(ip, i)
+	return ip
 }
 
 // validateInterfaceName validates that interface name is safe for shell commands
@@ -288,7 +290,7 @@ func (fw *TCFirewall) PopulateMaps() error {
 		}
 		// Use LittleEndian so the in-memory byte representation matches what eBPF expects
 		// eBPF ip->saddr on x86 is stored in little-endian format
-		ipUint := binary.LittleEndian.Uint32(ipBytes)
+		ipUint := binary.BigEndian.Uint32(ipBytes)
 		global.GetLogger().Sugar().Debugf("PopulateMaps: adding IP %s -> uint32 %d (0x%08x)", ipStr, ipUint, ipUint)
 		if err := fw.objs.ProtectedIps.Update(ipUint, one, ebpf.UpdateAny); err != nil {
 			global.GetLogger().Sugar().Errorf("PopulateMaps: failed to update IP map for %s: %v", ipStr, err)
@@ -382,7 +384,7 @@ func (fw *TCFirewall) ReloadConfig() error {
 			global.GetLogger().Sugar().Warnf("ReloadConfig: IP '%s' is not IPv4, skipping", ipStr)
 			continue
 		}
-		ipUint := binary.LittleEndian.Uint32(ipBytes)
+		ipUint := binary.BigEndian.Uint32(ipBytes)
 		newIPs[ipUint] = one
 	}
 
@@ -478,7 +480,7 @@ func (fw *TCFirewall) restoreMaps(cfg config.FirewallConfig) error {
 		if ipBytes == nil {
 			continue
 		}
-		ipUint := binary.LittleEndian.Uint32(ipBytes)
+		ipUint := binary.BigEndian.Uint32(ipBytes)
 		if err := fw.objs.ProtectedIps.Update(ipUint, one, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("restore IP %s: %w", ipStr, err)
 		}
@@ -566,9 +568,11 @@ func (fw *TCFirewall) startEventReader() {
 					continue
 				}
 
-				// Parse event data (little-endian as stored by eBPF)
+				// Parse event data
+				// src_ip is in network byte order (big-endian) from eBPF ip->saddr
+				// port is in host byte order (little-endian on x86) from bpf_ntohs
 				event := DropEvent{
-					SrcIP:    binary.LittleEndian.Uint32(data[0:4]),
+					SrcIP:    binary.BigEndian.Uint32(data[0:4]),
 					Port:     binary.LittleEndian.Uint16(data[4:6]),
 					Protocol: data[6],
 				}
