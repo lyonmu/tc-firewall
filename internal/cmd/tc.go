@@ -356,12 +356,9 @@ func (fw *TCFirewall) ClearMaps() error {
 // ReloadConfig reloads the configuration from the config manager
 // This function performs atomic reload using update-in-place to avoid security gaps during reconfiguration
 func (fw *TCFirewall) ReloadConfig() error {
-	// Get current and new configs
-	var oldCfg config.FirewallConfig
-	if fw.configMgr != nil {
-		oldCfg = fw.configMgr.GetConfig()
-	}
+	// Get config once to avoid race condition between two GetConfig() calls
 	cfg := fw.configMgr.GetConfig()
+	oldCfg := cfg // Snapshot for rollback
 	one := uint8(1)
 
 	// Build new maps

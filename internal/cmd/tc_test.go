@@ -185,3 +185,34 @@ func TestClose_NoDoubleClose(t *testing.T) {
 		t.Error("LastEventTs.Close() is called individually AND via fw.objs.Close() — double close")
 	}
 }
+
+func TestReloadConfig_SingleConfigRead(t *testing.T) {
+	src, err := os.ReadFile("tc.go")
+	if err != nil {
+		t.Fatalf("Failed to read tc.go: %v", err)
+	}
+
+	code := string(src)
+
+	// Find ReloadConfig method
+	reloadStart := strings.Index(code, "func (fw *TCFirewall) ReloadConfig() error {")
+	if reloadStart == -1 {
+		t.Fatal("ReloadConfig() method not found")
+	}
+
+	// Find the end of the function (next func declaration or end of file)
+	rest := code[reloadStart:]
+	nextFunc := strings.Index(rest[1:], "\nfunc ")
+	var reloadMethod string
+	if nextFunc == -1 {
+		reloadMethod = rest
+	} else {
+		reloadMethod = rest[:nextFunc+1]
+	}
+
+	// Count occurrences of GetConfig()
+	count := strings.Count(reloadMethod, ".GetConfig()")
+	if count > 1 {
+		t.Errorf("GetConfig() called %d times in ReloadConfig — should be called once and stored in variable", count)
+	}
+}
