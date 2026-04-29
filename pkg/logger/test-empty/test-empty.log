@@ -1,0 +1,4 @@
+2026-04-29 17:34:18	[test-empty] INFO	logger/logger_test.go:199	test message
+2026-04-29 17:34:40	[test-empty] INFO	logger/logger_test.go:205	test message
+2026-04-29 17:35:34	[test-empty] INFO	logger/logger_test.go:205	test message
+2026-04-29 17:35:51	[test-empty] INFO	logger/logger_test.go:205	test message

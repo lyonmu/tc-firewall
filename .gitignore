@@ -49,5 +49,4 @@ bin/
 docs/
 *_bpfeb.go
 *_bpfel.go
-AGENTS.md
-CLAUDE.md
+
