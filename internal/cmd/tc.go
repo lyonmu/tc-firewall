@@ -637,15 +637,6 @@ func (fw *TCFirewall) Close() error {
 	if fw.ingress != nil {
 		fw.ingress.Close()
 	}
-	if fw.objs.ProtectedIps != nil {
-		fw.objs.ProtectedIps.Close()
-	}
-	if fw.objs.ProtectedPorts != nil {
-		fw.objs.ProtectedPorts.Close()
-	}
-	if fw.objs.LastEventTs != nil {
-		fw.objs.LastEventTs.Close()
-	}
 	fw.objs.Close()
 	return nil
 }

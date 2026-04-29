@@ -3,6 +3,8 @@ package cmd
 import (
 	"encoding/binary"
 	"net"
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -151,5 +153,35 @@ func TestProtocolName(t *testing.T) {
 				t.Errorf("protocolName(%d) = %s, want %s", tt.proto, result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestClose_NoDoubleClose(t *testing.T) {
+	// Verify that Close() doesn't call individual map Close() before fw.objs.Close()
+	// fw.objs.Close() already closes all embedded maps and programs
+	src, err := os.ReadFile("tc.go")
+	if err != nil {
+		t.Fatalf("Failed to read tc.go: %v", err)
+	}
+
+	code := string(src)
+
+	// Find the Close() method
+	closeStart := strings.Index(code, "func (fw *TCFirewall) Close() error {")
+	if closeStart == -1 {
+		t.Fatal("Close() method not found")
+	}
+
+	closeMethod := code[closeStart:]
+
+	// Check that individual map Close() calls are NOT present before fw.objs.Close()
+	if strings.Contains(closeMethod, "fw.objs.ProtectedIps.Close()") {
+		t.Error("ProtectedIps.Close() is called individually AND via fw.objs.Close() — double close")
+	}
+	if strings.Contains(closeMethod, "fw.objs.ProtectedPorts.Close()") {
+		t.Error("ProtectedPorts.Close() is called individually AND via fw.objs.Close() — double close")
+	}
+	if strings.Contains(closeMethod, "fw.objs.LastEventTs.Close()") {
+		t.Error("LastEventTs.Close() is called individually AND via fw.objs.Close() — double close")
 	}
 }
