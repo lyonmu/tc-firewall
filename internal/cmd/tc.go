@@ -17,10 +17,22 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
 	"github.com/cilium/ebpf/rlimit"
+	"golang.org/x/sys/unix"
+
 	"github.com/lyonmu/tc-firewall/ebpf/port_protection"
 	"github.com/lyonmu/tc-firewall/internal/config"
 	"github.com/lyonmu/tc-firewall/internal/global"
 	"github.com/lyonmu/tc-firewall/pkg"
+)
+
+// Firewall constants
+const (
+	dirMode          = 0755
+	perfBufferSize   = 8192
+	perfErrorBackoff = 100 * time.Millisecond
+	minDropEventSize = 8
+	shutdownTimeout  = 2 * time.Second
+	signalBufferSize = 5
 )
 
 // DropEvent represents a dropped packet event from eBPF
@@ -34,9 +46,9 @@ type DropEvent struct {
 // protocolName returns protocol name from number
 func protocolName(p uint8) string {
 	switch p {
-	case 6:
+	case unix.IPPROTO_TCP:
 		return "TCP"
-	case 17:
+	case unix.IPPROTO_UDP:
 		return "UDP"
 	default:
 		return fmt.Sprintf("%d", p)
@@ -105,7 +117,7 @@ func (fw *TCFirewall) Load() error {
 	pinPath := fmt.Sprintf("/sys/fs/bpf/tc-firewall-p%d", os.Getpid())
 
 	// Create pin path directory if it doesn't exist
-	if err := os.MkdirAll(pinPath, 0755); err != nil {
+	if err := os.MkdirAll(pinPath, dirMode); err != nil {
 		return fmt.Errorf("create pin path directory %s: %w", pinPath, err)
 	}
 
@@ -223,7 +235,9 @@ func (fw *TCFirewall) attachViaTCCommand(ifaceName string) error {
 
 	// Store cleanup function for Close()
 	fw.tcLinkCleanup = func() {
-		exec.Command("tc", "filter", "del", "dev", ifaceName, "ingress").Run()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		exec.CommandContext(ctx, "tc", "filter", "del", "dev", ifaceName, "ingress").Run()
 		os.Remove(progPath)
 	}
 	fw.ingress = nil // No link to close via cilium/ebpf
@@ -288,8 +302,7 @@ func (fw *TCFirewall) PopulateMaps() error {
 			global.GetLogger().Sugar().Warnf("PopulateMaps: IP '%s' is not IPv4, skipping", ipStr)
 			continue
 		}
-		// Use LittleEndian so the in-memory byte representation matches what eBPF expects
-		// eBPF ip->saddr on x86 is stored in little-endian format
+		// Use BigEndian (network byte order) — eBPF stores ip->saddr in network byte order
 		ipUint := binary.BigEndian.Uint32(ipBytes)
 		global.GetLogger().Sugar().Debugf("PopulateMaps: adding IP %s -> uint32 %d (0x%08x)", ipStr, ipUint, ipUint)
 		if err := fw.objs.ProtectedIps.Update(ipUint, one, ebpf.UpdateAny); err != nil {
@@ -356,6 +369,9 @@ func (fw *TCFirewall) ClearMaps() error {
 // ReloadConfig reloads the configuration from the config manager
 // This function performs atomic reload using update-in-place to avoid security gaps during reconfiguration
 func (fw *TCFirewall) ReloadConfig() error {
+	if fw.configMgr == nil {
+		return fmt.Errorf("no config manager available")
+	}
 	// Get config once to avoid race condition between two GetConfig() calls
 	cfg := fw.configMgr.GetConfig()
 	oldCfg := cfg // Snapshot for rollback
@@ -525,7 +541,7 @@ func (fw *TCFirewall) startEventReader() {
 	}
 
 	// Use larger buffer for high-traffic scenarios (per CPU)
-	rd, err := perf.NewReader(fw.objs.Events, 8192)
+	rd, err := perf.NewReader(fw.objs.Events, perfBufferSize)
 	if err != nil {
 		global.GetLogger().Sugar().Errorf("Failed to create perf reader: %v", err)
 		return
@@ -555,13 +571,13 @@ func (fw *TCFirewall) startEventReader() {
 						return
 					}
 					global.GetLogger().Sugar().Errorf("Failed to read from perf buffer: %v", err)
-					time.Sleep(100 * time.Millisecond)
+					time.Sleep(perfErrorBackoff)
 					continue
 				}
 
 				// RawSample contains the event data directly (no perf header to skip)
 				data := record.RawSample
-				if len(data) < 8 { // DropEvent is 8 bytes (4+2+1+1)
+				if len(data) < minDropEventSize { // DropEvent is 8 bytes (4+2+1+1)
 					continue
 				}
 
@@ -572,6 +588,7 @@ func (fw *TCFirewall) startEventReader() {
 					SrcIP:    binary.BigEndian.Uint32(data[0:4]),
 					Port:     binary.LittleEndian.Uint16(data[4:6]),
 					Protocol: data[6],
+					Dir:      data[7],
 				}
 
 				global.GetLogger().Sugar().Debugf("BLOCKED: client=%s attempted access to protected port %d/%s",
@@ -616,7 +633,7 @@ func (fw *TCFirewall) Close() error {
 	select {
 	case <-done:
 		// Goroutines exited cleanly
-	case <-time.After(2 * time.Second):
+	case <-time.After(shutdownTimeout):
 		global.GetLogger().Sugar().Warn("Timeout waiting for goroutines to exit, forcing shutdown")
 	}
 
@@ -702,7 +719,7 @@ func RunTCFirewall(fw *TCFirewall, ifaceName string) {
 	}
 
 	// Wait for shutdown
-	stop := make(chan os.Signal, 5)
+	stop := make(chan os.Signal, signalBufferSize)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
 }
@@ -714,26 +731,22 @@ func StartTCFirewall(ifaceName string, configPath string, configType string) {
 	fw, err := NewTCFirewall(configPath, configType)
 	if err != nil {
 		global.GetLogger().Sugar().Fatalf("Create firewall: %v", err)
-		os.Exit(1)
 	}
 	defer fw.Close()
 
 	// Load eBPF programs
 	if err := fw.Load(); err != nil {
 		global.GetLogger().Sugar().Fatalf("Load eBPF: %v", err)
-		os.Exit(1)
 	}
 
 	// Populate maps with config
 	if err := fw.PopulateMaps(); err != nil {
 		global.GetLogger().Sugar().Fatalf("Populate maps: %v", err)
-		os.Exit(1)
 	}
 
 	// Attach to interface (ingress only)
 	if err := fw.Attach(ifaceName); err != nil {
 		global.GetLogger().Sugar().Fatalf("Attach TC: %v", err)
-		os.Exit(1)
 	}
 
 	// Run the firewall (blocking)

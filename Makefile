@@ -2,7 +2,7 @@ VERSION =  $(shell git describe --tags --exact-match 2>/dev/null || git branch  
 REVISION = $(shell git rev-parse HEAD)
 BRANCH = $(shell git branch  --show-current)
 COMPILE_TIME= $(shell date +"%Y-%m-%d %H:%M:%S")
-USER = $(shell  git log -1 --pretty=format:"%an")
+USER = $(shell id -un)
 PROJECT_NAME = $(notdir $(CURDIR))
 FLAGS = -ldflags "-s -w \
 	-X 'github.com/prometheus/common/version.Version=${VERSION}' \
@@ -13,7 +13,7 @@ FLAGS = -ldflags "-s -w \
 
 TAGS = -tags="sonic avx netgo osusergo"
 
-.PHONY: build build-amd64 build-386 build-arm build-arm64 build-all clean ebpf help
+.PHONY: build build-amd64 build-386 build-arm build-arm64 build-all clean ebpf test lint fmt help
 
 default: build
 
@@ -39,6 +39,15 @@ build-all: build-amd64 build-386 build-arm build-arm64
 clean:
 	rm -rf bin/
 	rm -f ebpf/port_protection/portprotection_*.go ebpf/port_protection/portprotection_*.o
+
+test:
+	go test -race -cover ./...
+
+lint:
+	go vet ./...
+
+fmt:
+	go fmt ./...
 
 help:
 	@echo "Usage: make <target>"

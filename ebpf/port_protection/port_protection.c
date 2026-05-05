@@ -126,6 +126,10 @@ int tc_ingress_filter(struct __sk_buff *skb) {
     if (data + sizeof(*eth) + sizeof(*ip) > data_end)
         return TC_ACT_OK;
 
+    // Check for IP fragments - if fragmented, we can't safely read transport headers
+    if (ip->frag_off & bpf_htons(0x1FFF))
+        return TC_ACT_OK;  // Allow fragments (can't inspect)
+
     // Get source IP (client IP sending the request)
     __u32 src_ip = ip->saddr;
 

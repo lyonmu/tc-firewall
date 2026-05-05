@@ -43,11 +43,11 @@ func createModuleEncoderConfig(moduleName string, baseConfig zapcore.EncoderConf
 }
 
 // NewZapLogger 创建配置好的Zap logger
-func NewZapLogger(config LogConfig) *zap.Logger {
+func NewZapLogger(config LogConfig) (*zap.Logger, error) {
 	// 确保日志目录存在
 	if config.Path != "" {
 		if err := os.MkdirAll(filepath.Join(config.Path, config.Module), 0755); err != nil {
-			panic(err)
+			return nil, fmt.Errorf("create log directory: %w", err)
 		}
 	}
 
@@ -145,5 +145,5 @@ func NewZapLogger(config LogConfig) *zap.Logger {
 		zap.AddStacktrace(zapcore.ErrorLevel),
 	)
 
-	return logger
+	return logger, nil
 }

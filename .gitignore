@@ -50,3 +50,10 @@ docs/
 *_bpfeb.go
 *_bpfel.go
 
+# Test artifacts
+**/test-empty/
+*.log
+
+# Temporary files
+*.tmp
+

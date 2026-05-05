@@ -24,9 +24,9 @@ func TestNewZapLogger_ConsoleFormat(t *testing.T) {
 		Format:  "console",
 	}
 
-	logger := NewZapLogger(cfg)
-	if logger == nil {
-		t.Fatal("NewZapLogger returned nil")
+	logger, err := NewZapLogger(cfg)
+	if err != nil {
+		t.Fatalf("NewZapLogger failed: %v", err)
 	}
 	defer logger.Sync()
 
@@ -53,9 +53,9 @@ func TestNewZapLogger_JSONFormat(t *testing.T) {
 		Format:  "json",
 	}
 
-	logger := NewZapLogger(cfg)
-	if logger == nil {
-		t.Fatal("NewZapLogger returned nil")
+	logger, err := NewZapLogger(cfg)
+	if err != nil {
+		t.Fatalf("NewZapLogger failed: %v", err)
 	}
 	defer logger.Sync()
 
@@ -82,9 +82,9 @@ func TestNewZapLogger_WithConsole(t *testing.T) {
 		Format:  "console",
 	}
 
-	logger := NewZapLogger(cfg)
-	if logger == nil {
-		t.Fatal("NewZapLogger returned nil")
+	logger, err := NewZapLogger(cfg)
+	if err != nil {
+		t.Fatalf("NewZapLogger failed: %v", err)
 	}
 	defer logger.Sync()
 
@@ -105,9 +105,9 @@ func TestNewZapLogger_DebugLevel(t *testing.T) {
 		Format:  "console",
 	}
 
-	logger := NewZapLogger(cfg)
-	if logger == nil {
-		t.Fatal("NewZapLogger returned nil")
+	logger, err := NewZapLogger(cfg)
+	if err != nil {
+		t.Fatalf("NewZapLogger failed: %v", err)
 	}
 	defer logger.Sync()
 
@@ -129,9 +129,9 @@ func TestNewZapLogger_WarnLevel(t *testing.T) {
 		Format:  "console",
 	}
 
-	logger := NewZapLogger(cfg)
-	if logger == nil {
-		t.Fatal("NewZapLogger returned nil")
+	logger, err := NewZapLogger(cfg)
+	if err != nil {
+		t.Fatalf("NewZapLogger failed: %v", err)
 	}
 	defer logger.Sync()
 
@@ -151,9 +151,9 @@ func TestNewZapLogger_ErrorLevel(t *testing.T) {
 		Format:  "console",
 	}
 
-	logger := NewZapLogger(cfg)
-	if logger == nil {
-		t.Fatal("NewZapLogger returned nil")
+	logger, err := NewZapLogger(cfg)
+	if err != nil {
+		t.Fatalf("NewZapLogger failed: %v", err)
 	}
 	defer logger.Sync()
 
@@ -173,9 +173,9 @@ func TestNewZapLogger_InvalidLevel_DefaultsToInfo(t *testing.T) {
 		Format:  "console",
 	}
 
-	logger := NewZapLogger(cfg)
-	if logger == nil {
-		t.Fatal("NewZapLogger returned nil")
+	logger, err := NewZapLogger(cfg)
+	if err != nil {
+		t.Fatalf("NewZapLogger failed: %v", err)
 	}
 	defer logger.Sync()
 
@@ -195,9 +195,9 @@ func TestNewZapLogger_EmptyPath(t *testing.T) {
 		Format:  "console",
 	}
 
-	logger := NewZapLogger(cfg)
-	if logger == nil {
-		t.Fatal("NewZapLogger returned nil")
+	logger, err := NewZapLogger(cfg)
+	if err != nil {
+		t.Fatalf("NewZapLogger failed: %v", err)
 	}
 	defer logger.Sync()
 

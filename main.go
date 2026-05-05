@@ -28,33 +28,34 @@ func main() {
 
 	// Initialize logger
 	global.SetCfg(&cfg)
-	global.SetLogger(logger.NewZapLogger(cfg.Log))
+	log, err := logger.NewZapLogger(cfg.Log)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
+		os.Exit(1)
+	}
+	global.SetLogger(log)
 	global.GetLogger().Sugar().Info("TC Firewall starting...")
 
 	// Create firewall instance
 	fw, err := cmd.NewTCFirewall(cfg.ConfigPath, cfg.ConfigType)
 	if err != nil {
 		global.GetLogger().Sugar().Fatalf("Create firewall: %v", err)
-		os.Exit(1)
 	}
 	defer fw.Close()
 
 	// Load eBPF programs
 	if err := fw.Load(); err != nil {
 		global.GetLogger().Sugar().Fatalf("Load eBPF: %v", err)
-		os.Exit(1)
 	}
 
 	// Populate maps with config
 	if err := fw.PopulateMaps(); err != nil {
 		global.GetLogger().Sugar().Fatalf("Populate maps: %v", err)
-		os.Exit(1)
 	}
 
 	// Attach to interface (ingress only)
 	if err := fw.Attach(cfg.Interface); err != nil {
 		global.GetLogger().Sugar().Fatalf("Attach TC: %v", err)
-		os.Exit(1)
 	}
 
 	// Run the firewall (blocking)

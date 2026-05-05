@@ -12,11 +12,12 @@ import (
 
 // ConfigManager 是一个泛型配置管理器，支持类型安全的配置热重载
 type ConfigManager[T any] struct {
-	mu      sync.RWMutex  // 读写锁，保护配置数据
-	v       *viper.Viper  // viper实例
-	cfg     T             // 当前配置，泛型类型
-	exit    chan struct{} // 用于优雅关闭监听
-	watchCh chan struct{} // 用于通知配置变更
+	mu        sync.RWMutex  // 读写锁，保护配置数据
+	v         *viper.Viper  // viper实例
+	cfg       T             // 当前配置，泛型类型
+	exit      chan struct{} // 用于优雅关闭监听
+	watchCh   chan struct{} // 用于通知配置变更
+	closeOnce sync.Once     // 防止重复关闭
 }
 
 // NewConfigManager 创建一个新的泛型配置管理器
@@ -85,6 +86,14 @@ func (cm *ConfigManager[T]) watchConfig() {
 			return
 		}
 
+		// Validate if the config type supports it
+		if v, ok := any(&newCfg).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				log.Sugar().Errorf("Config validation failed: %v", err)
+				return
+			}
+		}
+
 		// 更新配置
 		cm.cfg = newCfg
 		log.Sugar().Info("Config successfully reloaded")
@@ -114,13 +123,15 @@ func (cm *ConfigManager[T]) GetConfig() T {
 	return cfg
 }
 
-// GetConfigPtr 获取当前配置的指针，适用于大配置结构避免复制
-// 注意：调用者不应修改返回的配置
+// GetConfigPtr returns a pointer to the current config for large structs.
+// Deprecated: returns a copy as pointer to avoid race conditions.
+// Use GetConfig() for safe access.
 func (cm *ConfigManager[T]) GetConfigPtr() *T {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 
-	return &cm.cfg
+	cfg := cm.cfg
+	return &cfg
 }
 
 // Watch 返回一个通道，用于监听配置变更事件
@@ -130,6 +141,8 @@ func (cm *ConfigManager[T]) Watch() <-chan struct{} {
 
 // Close 停止监听配置变化
 func (cm *ConfigManager[T]) Close() {
-	close(cm.exit)
-	close(cm.watchCh)
+	cm.closeOnce.Do(func() {
+		close(cm.exit)
+		close(cm.watchCh)
+	})
 }
